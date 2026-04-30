@@ -1,0 +1,84 @@
+alias: Battery charging control
+description: description
+triggers:
+  - at: "04:00:00"
+    trigger: time
+  - event: start
+    trigger: homeassistant
+actions:
+  - repeat:
+      until:
+        - condition: template
+          value_template: "{{ target_limit | int == -1 }}"
+      sequence:
+        - action: goodwe.get_parameter
+          data:
+            device_id: **#you need to get your inverter ID**
+            parameter: battery_charge_current
+            entity_id: input_number.battery_charge_limit_duplicator **# I use it to store charging current from inverter in HA variable (helper)**
+        - variables:
+            i_max: 12
+            soc: "{{ states('sensor.goodwe_battery_state_of_charge')|float }}"
+            needed_soc: "{{ (states('input_number.margin_evening')|float - 40) }}" **#this is value for SoC that I need to have at 15:00 (end of cheap tarif to withstand till 22:00 begining of cheap tarif)
+            soc_min: "{{ [needed_soc - 2, 10] | max }}" **# I disabled this feature for the summer, together with soc_max should provide minium soc for charging outside optimal window eg. your minimum SoC is 10% and you already have 12 so this should allow for charging till eg. 20, when stop and wait for optimal chargine window and if drops below eg.18 it will charge again outside optimal window**
+            soc_max: "{{ [soc_min + 0, 100] | min }}" 
+            now_hour: "{{ now().hour + now().minute/60 }}"
+            current_price: "{{ states('sensor.rce_pse_price') | float(999) }}"
+            current_limit: "{{ states('input_number.battery_charge_limit_duplicator')|int }}"
+            optimal_window_hour: >-
+              {% set raw = states('sensor.battery_charge_optimal_window') %} {%
+              if raw == 'ErrForecast' or raw == 'Off' %}
+                0
+              {% elif raw == 'ErrRCE' or raw == 'BattFull' %}
+                25
+              {% else %}
+                {% set start_part = raw.split('-')[0] %}
+                {% set h,m = start_part.split(':') %}
+                {{ (h|int) + (m|int)/60 }}
+              {% endif %}
+            charge_and_terminate: "{{ now_hour > 12.5 or now_hour > optimal_window_hour }}" **# If optimal window starts after 12:30 automation will start it at 12:30
+            target_limit: |-
+              {% if charge_and_terminate %} **# this sets charging and terminates automation**
+                -1
+              {% elif soc <= soc_min %} **# this sets charging and doesn't terminate automation (it will control SoC) and can disable charging still waiting for optimal window**
+                1
+              {% elif soc >= soc_max and optimal_window_hour != 25 %} **# this disables charging and doesn't terminate automation (it will control SoC) and still waiting for optimal window**
+                0
+              {% else %} **# not remember to be honest - maybe leftover from error state tbd**
+                3
+              {% endif %}
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {{ target_limit | int == 1 or target_limit | int == -1 and
+                    current_limit == 0 }}
+              sequence:
+                - data:
+                    name: Battery charging control
+                    message: >
+                      target_limit={{ target_limit }}, soc={{ soc }}, → ustawiam
+                      ładowanie na {{ i_max }}A
+                  action: logbook.log
+                - data:
+                    device_id: **#inverter id**
+                    parameter: battery_charge_current
+                    value: "{{ i_max }}"
+                  action: goodwe.set_parameter
+            - conditions:
+                - condition: template
+                  value_template: "{{ target_limit | int == 0 and current_limit != 0  }}"
+              sequence:
+                - data:
+                    name: Battery charging control
+                    message: >
+                      target_limit={{ target_limit }}, soc={{ soc }}, → blokuję
+                      ładowanie (0A)
+                  action: logbook.log
+                - data:
+                    device_id: **#inverter id**
+                    parameter: battery_charge_current
+                    value: 0
+                  action: goodwe.set_parameter
+        - delay: "00:02:00" **# in a 2 minutes loop**
+mode: single
