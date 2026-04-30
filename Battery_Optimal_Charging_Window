@@ -1,0 +1,134 @@
+{% set rce_prices = state_attr('sensor.rce_pse_price','prices') %} **# PSE price 15min, PLN/MWh**
+{% set solar_forecast = state_attr('sensor.solar_forecast_today','hours') %} **#sensor with expected PV prodution with attribute 'hours' in format like '10:00': 4.388**
+{% set target_energy = states('number.battery_missing_energy') | float(0) %} **#sensor that counts how many kWh is missing in the battery based on battery SoC (and SoH)**
+{% set house_consumption = 0.5 * 0.25 %} **#assumed idle house consumption 500W**
+
+{% if target_energy == 0 %}
+    BattFull
+{% elif states('input_boolean.optimize_battery_charging') == 'off' %} **#I have a input switch to disable macro end return Off that is later used by automation script that triggers charging if this helper provided valid time**
+    Off
+{% elif states('sensor.solar_forecast_ml_expected_daily_production') in ['unknown','unavailable'] or solar_forecast is none or solar_forecast | length == 0 %}
+    ErrForecast
+{% elif states('sensor.rce_pse_price') in ['unknown','unavailable'] or rce_prices is none or rce_prices | length == 0 %}
+    ErrRCE
+{% else %}
+
+{% set ns = namespace(min_total=999999, best_window=[]) %}
+{% set max_index = 95 %}
+
+{% set first_slot = namespace(value=None) %}
+{% set last_slot = namespace(value=None) %}
+
+{% for h in range(0, 24) %} **# checks whether there is sence to calculate optimal window or today's energy production will not be sufficient and you should charge entire day**
+    {% set f_hour = (solar_forecast['%02d:00' | format(h)] | float(0)) %}
+    {% if f_hour > 0 %}
+        {% if first_slot.value is none %}
+            {% set first_slot.value = h * 4 %}
+        {% endif %}
+        {% set last_slot.value = h * 4 + 3 %}
+    {% endif %}
+{% endfor %}
+
+{% if first_slot.value is none %}
+    {% set first_slot.value = 0 %}
+    {% set last_slot.value = max_index %}
+{% endif %}
+
+{% set total_possible = namespace(value=0) %}
+{% set first_hour = first_slot.value // 4 %}
+{% set last_hour = last_slot.value // 4 %}
+
+{% for h in range(first_hour, last_hour + 1) %}
+    {% set f = (solar_forecast['%02d:00' | format(h)] | float(0)) - house_consumption * 4 %}
+    {% if f < 0 %} {% set f = 0 %} {% endif %}
+    {% if f > 3.6 %} {% set f = 3.6 %} {% endif %} **#I have max battery charging power 3.6kW so it's limiting in few areas**
+    {% set total_possible.value = total_possible.value + f %}
+{% endfor %}
+
+{% if total_possible.value <= target_energy %}
+    {{ '00:00-24:00' }}
+{% else %}
+
+{% for start in range(first_slot.value, last_slot.value + 1) %}
+    {% set total_energy = namespace(value=0) %}
+    {% set total_cost = namespace(value=0) %}
+    {% set end_slot = start %}
+
+    {% for i in range(start, last_slot.value + 1) %}
+        {% set hour = i // 4 %}
+        {% set forecast = (solar_forecast['%02d:00' | format(hour)] | float(0)) * 0.25 %}
+        {% set forecast = forecast - house_consumption %}
+        {% if forecast < 0 %} {% set forecast = 0 %} {% endif %}
+        {% if forecast > 3.6 * 0.25 %} {% set forecast = 3.6 * 0.25 %} {% endif %} **#I have max battery charging power 3.6kW so it's limiting in few areas**
+        {% set price = (rce_prices[i]['rce_pln']) * 0.001 %}
+        {% if price < 0 %} {% set price = 0 %} {% endif %}
+
+        {% set remaining = target_energy - total_energy.value %}
+        {% if forecast > remaining %}
+            {% set used = remaining %}
+        {% else %}
+            {% set used = forecast %}
+        {% endif %}
+
+        {% set total_energy.value = total_energy.value + used %}
+        {% set total_cost.value = total_cost.value + (price * used) %}
+        {% set end_slot = i %}
+
+        {% if total_energy.value >= target_energy %}
+            {% if total_cost.value < ns.min_total %}
+                {% set ns.min_total = total_cost.value %}
+                {% set ns.best_window = range(start, end_slot + 1) | list %}
+            {% endif %}
+            {% break %}
+        {% endif %}
+    {% endfor %}
+{% endfor %}
+
+{% set start_slot = ns.best_window[0] %}
+{% set end_slot = ns.best_window[-1] %}
+
+{% set ns_avg = namespace(sum=0, count=0) %}
+
+{% for i in range(start_slot, end_slot + 1) %}
+    {% set price = rce_prices[i]['rce_pln'] | float(0) %}
+
+    {% if price < 0 %}
+        {% set price = 0 %}
+    {% endif %}
+
+    {% set ns_avg.sum = ns_avg.sum + price %}
+    {% set ns_avg.count = ns_avg.count + 1 %}
+{% endfor %}
+
+{% set avg_rce_price = (ns_avg.sum / ns_avg.count) if ns_avg.count > 0 else 0 %}
+
+{% set price_limit = avg_rce_price + states('input_number.rce_early_charge_margin') | float(0) %} **#This variable allows to extend initially calculated optimal windows for a sligthly higher energy cost window. e.g. you have negative price for time window 11-14 but at 10 it is already 5PL/MWh or 30 (0,5gr/kWh or 3gr/kWh so the script will extend optimal window as long as the price will not be that value bigger than calculated average from optimal window**
+
+{% set ns = namespace(extended=start_slot) %}
+{% for i in range(start_slot - 1, -1, -1) %}
+    {% set price = rce_prices[i]['rce_pln'] | float(0) %}
+    {% if price <= price_limit %}
+        {% set ns.extended = i %}
+    {% else %}
+        {% break %}
+    {% endif %}
+{% endfor %}
+{% set start_slot = ns.extended %}
+
+{% if start_slot == first_slot.value %} **#extend 0:00 hour if there is no production before optimal window e.g. optimal production window starts from 6:00 and sunrise is at 6:30 - there is no sens to block charging (I have my automation starting at 4:00 that is initially blocking charging just to at 6: allow for charging)**
+    {% set start_slot = 0 %}
+{% endif %}
+
+{% if end_slot == last_slot.value %} **#similar but after the evening, extend to 24:00**
+    {% set end_slot = max_index %}
+{% endif %}
+
+{% set start_h = start_slot // 4 %}
+{% set start_m = (start_slot % 4) * 15 %}
+{% set end_h = (end_slot + 1) // 4 %}
+{% set end_m = ((end_slot + 1) % 4) * 15 %}
+
+{{ '%02d:%02d' | format(start_h,start_m) }}-{{ '%02d:%02d' | format(end_h,end_m) }}
+
+{% endif %}
+{% endif %}
