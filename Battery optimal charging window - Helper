@@ -3,7 +3,6 @@
 {% set target_energy = states('number.battery_missing_energy') | float(0) %}
 {% set house_consumption = 0.5 * 0.25 %}
 
-{# ===================== NOWOŚĆ: agregacja RCE 15min -> 1h ===================== #}
 {% set rce_hourly = namespace(values=[]) %}
 
 {% for h in range(0, 24) %}
@@ -11,16 +10,13 @@
     {% for q in range(0,4) %}
         {% set i = h*4 + q %}
         {% set price = rce_prices[i]['rce_pln'] | float(0) %}
-        
-        {# zmiana: wartości <0 traktujemy jako 0 PRZED średnią #}
+
         {% if price < 0 %}
             {% set price = 0 %}
         {% endif %}
         
         {% set sum.v = sum.v + price %}
     {% endfor %}
-    
-    {# średnia godzinowa #}
     {% set rce_hourly.values = rce_hourly.values + [ (sum.v / 4) * 0.001 ] %}
 {% endfor %}
 {# ============================================================================ #}
@@ -83,9 +79,7 @@
         {% if forecast < 0 %} {% set forecast = 0 %} {% endif %}
         {% if forecast > 3.6 * 0.25 %} {% set forecast = 3.6 * 0.25 %} {% endif %}
 
-        {# ===================== ZMIANA: używamy ceny godzinowej ===================== #}
         {% set price = rce_hourly.values[hour] %}
-        {# ========================================================================== #}
 
         {% set remaining = target_energy - total_energy.value %}
         {% if forecast > remaining %}
@@ -116,10 +110,8 @@
 {% for i in range(start_slot, end_slot + 1) %}
     {% set hour = i // 4 %}
 
-    {# ===================== ZMIANA: średnia liczona z hourly ===================== #}
     {% set price = rce_hourly.values[hour] * 1000 %}
     {# (wracamy do PLN/MWh żeby zachować kompatybilność z margin) #}
-    {# ========================================================================== #}
 
     {% set ns_avg.sum = ns_avg.sum + price %}
     {% set ns_avg.count = ns_avg.count + 1 %}
@@ -133,9 +125,7 @@
 {% for i in range(start_slot - 1, -1, -1) %}
     {% set hour = i // 4 %}
 
-    {# ===================== ZMIANA ===================== #}
     {% set price = rce_hourly.values[hour] * 1000 %}
-    {# ================================================ #}
 
     {% if price <= price_limit %}
         {% set ns.extended = i %}
